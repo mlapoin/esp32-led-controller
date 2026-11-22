@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#14161a">
+<title>LED Controller</title>
+<style>
+  :root { --bg:#14161a; --panel:#1e2127; --line:#2d313a; --text:#f2f2f2; --muted:#9aa0aa; --accent:#3b6fe0; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 460px; margin: 0 auto; padding: 22px 16px 28px; }
+  h1 { font-size: 22px; margin: 0; }
+  .status { font-size: 13px; color: var(--muted); margin: 4px 0 16px; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #3ddc84; }
+  .dot.off { background: #ff5a5a; }
+  .layout { display: grid; grid-template-columns: 58px 1fr; gap: 12px; align-items: stretch; min-height: min(660px, calc(100vh - 110px)); }
+  /* The strip hangs top to bottom, so LED 0 is drawn at the bottom. */
+  .strip { display: flex; flex-direction: column-reverse; justify-content: space-between; align-items: center; padding: 14px 0; background: #0b0c0e; border: 1px solid var(--line); border-radius: 30px; }
+  .led { width: 16px; height: 16px; border-radius: 50%; background: #222; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+  section:last-child { margin-bottom: 0; }
+  .label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 10px; text-transform: uppercase; letter-spacing: .06em; }
+  .color-row { display: flex; align-items: center; gap: 10px; }
+  input[type=color] { flex: 0 0 52px; width: 52px; height: 52px; border: none; padding: 0; background: none; border-radius: 12px; cursor: pointer; }
+  input[type=color]::-webkit-color-swatch-wrapper { padding: 0; }
+  input[type=color]::-webkit-color-swatch { border: 2px solid var(--line); border-radius: 12px; }
+  .swatches { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; flex: 1; }
+  .swatch { aspect-ratio: 1; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; }
+  .swatch.on { border-color: var(--text); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .bright-row { display: flex; align-items: center; gap: 10px; }
+  .bright-val { font-family: ui-monospace, Menlo, monospace; font-size: 14px; min-width: 40px; text-align: right; }
+  .effects { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+  .effects button { padding: 11px 0; border-radius: 10px; border: 1px solid var(--line); background: transparent; color: var(--text); font-size: 14px; font-weight: 600; cursor: pointer; }
+  .effects button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .error { color: #ff7a7a; font-size: 13px; min-height: 18px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>LED Controller</h1>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">Connecting…</span></div>
+
+  <div class="layout">
+    <div class="strip" id="strip" aria-label="Live preview of the LED strip"></div>
+
+    <div>
+      <section>
+        <span class="label">Effect</span>
+        <div class="effects" id="effects">
+          <button data-effect="snow">Snow</button>
+          <button data-effect="solid">Solid</button>
+          <button data-effect="rainbow">Rainbow</button>
+          <button data-effect="breathe">Breathe</button>
+          <button data-effect="off">Off</button>
+        </div>
+        <div class="error" id="error" role="status"></div>
+      </section>
+
+      <section>
+        <span class="label">Color</span>
+        <div class="color-row">
+          <input type="color" id="color" value="#1e3a8a" aria-label="Pick any color">
+          <div class="swatches" id="swatches"></div>
+        </div>
+        <div class="hint" id="hint">In Snow, this tints the sky.</div>
+      </section>
+
+      <section>
+        <label class="label" for="brightness">Brightness</label>
+        <div class="bright-row">
+          <input type="range" id="brightness" min="0" max="255" value="160">
+          <span class="bright-val" id="brightVal">63%</span>
+        </div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script>
+  const PRESETS = ['#1e3a8a', '#0a84ff', '#00c7be', '#34c759', '#ffd60a', '#ff9500', '#ff3b30', '#ff0066', '#bf5af2', '#ffffff'];
+
+  let state = { color: '1e3a8a', brightness: 160, effect: 'snow', numLeds: 30 };
+  let sendTimer = null;
+  let pending = {};
+
+  const $ = id => document.getElementById(id);
+
+  // ---- Talking to the ESP32 ----
+
+  // Sliders fire many events per second, so changes are batched and sent
+  // at most every 80 ms instead of flooding the ESP32 with requests.
+  function queue(changes) {
+    Object.assign(state, changes);
+    Object.assign(pending, changes);
+    render();
+    clearTimeout(sendTimer);
+    sendTimer = setTimeout(flush, 80);
+  }
+
+  async function flush() {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(pending)) params.set(k, v);
+    pending = {};
+    try {
+      const res = await fetch('/api/set?' + params.toString());
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Request failed');
+      setOnline(true);
+      $('error').textContent = '';
+    } catch (err) {
+      setOnline(false);
+      $('error').textContent = "Couldn't reach the lights. Check that the ESP32 is on.";
+    }
+  }
+
+  async function load() {
+    try {
+      const res = await fetch('/api/state');
+      state = await res.json();
+      setOnline(true);
+    } catch {
+      setOnline(false);
+    }
+    buildStrip();
+    render();
+  }
+
+  function setOnline(ok) {
+    $('dot').classList.toggle('off', !ok);
+    $('status').textContent = ok ? 'Connected' : 'Offline';
+  }
+
+  // ---- Controls ----
+
+  // Picking a color while the strip is off or on rainbow switches back to solid.
+  function colorChange(hex) {
+    const keep = state.effect === 'snow' || state.effect === 'breathe' || state.effect === 'solid';
+    queue({ color: hex, effect: keep ? state.effect : 'solid' });
+  }
+
+  function buildSwatches() {
+    $('swatches').innerHTML = PRESETS.map(c =>
+      `<button class="swatch" data-color="${c}" style="background:${c}" aria-label="Color ${c}"></button>`).join('');
+    $('swatches').addEventListener('click', e => {
+      const c = e.target.dataset.color;
+      if (c) colorChange(c.slice(1));
+    });
+  }
+
+  $('color').addEventListener('input', e => colorChange(e.target.value.slice(1)));
+  $('brightness').addEventListener('input', e => queue({ brightness: Number(e.target.value) }));
+  $('effects').addEventListener('click', e => {
+    const effect = e.target.dataset.effect;
+    if (effect) queue({ effect });
+  });
+
+  function render() {
+    const hex = '#' + state.color;
+    $('color').value = hex;
+    $('brightness').value = state.brightness;
+    $('brightVal').textContent = Math.round(state.brightness / 255 * 100) + '%';
+    $('hint').textContent = state.effect === 'snow' ? 'In Snow, this tints the sky.' : hex;
+    document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('on', s.dataset.color === hex));
+    document.querySelectorAll('#effects button').forEach(b => b.classList.toggle('on', b.dataset.effect === state.effect));
+    const accent = state.effect === 'off' ? '#555' : (state.color === 'ffffff' || state.effect === 'snow' && state.color === '1e3a8a') ? '#3b6fe0' : hex;
+    document.documentElement.style.setProperty('--accent', accent);
+  }
+
+  // ---- Live preview ----
+  // Mirrors what the firmware draws, using the same rules for each effect.
+
+  let ledEls = [];
+  let n = 30;
+  function buildStrip() {
+    n = Math.min(state.numLeds || 30, 30);
+    $('strip').innerHTML = '<span class="led"></span>'.repeat(n);
+    ledEls = [...document.querySelectorAll('.led')];  // index 0 is drawn at the bottom
+    snow.flakes = [];
+  }
+
+  function rgb(hex) {
+    const v = parseInt(hex, 16);
+    return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+  }
+  const scale = (c, k) => c.map(x => x * k);
+  const add = (a, b) => a.map((x, i) => Math.min(255, x + b[i]));
+
+  // Same snow rules as the firmware: flakes start at the top and fall at
+  // their own speeds, gliding between LEDs instead of jumping.
+  const SNOW = [210, 220, 255];
+  const snow = { flakes: [] };
+  function snowFrame(sky) {
+    const out = Array.from({ length: n }, () => sky.slice());
+    if (Math.random() < 8 / 256 && snow.flakes.length < 8) {
+      snow.flakes.push({ pos: n - 1, speed: 0.05 + Math.random() * 0.05 });
+    }
+    snow.flakes = snow.flakes.filter(f => {
+      f.pos -= f.speed;
+      if (f.pos < 0) return false;
+      const i = Math.floor(f.pos), below = 1 - (f.pos - i);
+      out[i] = add(out[i], scale(SNOW, below));
+      if (i + 1 < n) out[i + 1] = add(out[i + 1], scale(SNOW, 1 - below));
+      return true;
+    });
+    return out;
+  }
+
+  let last = 0;
+  function tick(t) {
+    requestAnimationFrame(tick);
+    if (t - last < 16) return;  // about 60 frames per second, like the firmware
+    last = t;
+    const level = 0.25 + 0.75 * (state.brightness / 255);
+    const base = rgb(state.color);
+    let frame;
+    if (state.effect === 'off' || state.brightness === 0) {
+      frame = Array.from({ length: n }, () => [28, 28, 28]);
+    } else if (state.effect === 'snow') {
+      // A screen looks darker than an LED at the same level, so the preview
+      // shows the dim sky a bit brighter than the firmware's 40/255.
+      frame = snowFrame(scale(base, 0.35)).map(c => scale(c, level));
+    } else if (state.effect === 'rainbow') {
+      frame = ledEls.map((_, i) => `hsl(${(t / 12 + i * 360 / n) % 360}, 100%, ${50 * level}%)`);
+    } else if (state.effect === 'breathe') {
+      const k = level * (0.15 + 0.85 * (0.5 + 0.5 * Math.sin(t / 800)));
+      frame = ledEls.map(() => scale(base, k));
+    } else {
+      frame = ledEls.map(() => scale(base, level));
+    }
+    ledEls.forEach((el, i) => {
+      const c = frame[i];
+      const css = typeof c === 'string' ? c : `rgb(${c.map(Math.round).join(',')})`;
+      const lit = typeof c === 'string' || c[0] + c[1] + c[2] > 120;
+      el.style.background = css;
+      el.style.boxShadow = lit ? `0 0 8px ${css}` : 'none';
+    });
+  }
+
+  buildSwatches();
+  load();
+  requestAnimationFrame(tick);
+</script>
+</body>
+</html>

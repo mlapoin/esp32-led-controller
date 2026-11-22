@@ -1,0 +1,10 @@
+# Wi-Fi credentials
+firmware/led_controller/secrets.h
+
+# Build output
+.pio/
+build/
+*.bin
+*.elf
+
+.DS_Store
